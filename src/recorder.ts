@@ -1,80 +1,103 @@
-import { chromium } from "playwright";
+import { chromium, Page } from "playwright";
+import * as fs from 'fs';
+import * as path from 'path';
 
-// Definir el tipo para las respuestas correctas
-// Al principio del archivo, después de las importaciones
-interface RespuestaCorrecta {
-  pregunta: string | RegExp;
+// Configuration
+const CONFIG = {
+  API: {
+    BASE_URL: 'http://localhost:3000',
+    ENDPOINTS: {
+      QUIZ_ANSWERS: '/api/quiz/answers'
+    }
+  },
+  TIMING: {
+    DEFAULT_ANSWER_DELAY: 3000, // 3 seconds
+    DEFAULT_QUESTION_TIMEOUT: 10000, // 10 seconds
+    DEFAULT_STABILIZATION_DELAY: 1000, // 1 second
+    DEFAULT_CLOSE_DELAY: 3000 // 3 seconds
+  },
+  SELECTORS: {
+    QUIZ_CONTAINER: '[data-testid="quiz-game-container"]',
+    QUESTION_COUNTER: '[data-testid="question-counter"]',
+    QUESTION_TEXT: '[data-testid="quiz-game-container"] .p-6 h2',
+    OPTION: (index?: number) => `[data-testid^="option-"]${index !== undefined ? `:nth-child(${index + 1})` : ''}`,
+    OPTION_TEXT: 'span.font-medium',
+    SCORE: 'div:text("Score:")'
+  }
+} as const;
+
+// Types
+interface QuizAnswer {
+  pregunta: string;
   respuesta: string;
 }
 
-// Mapa de preguntas a respuestas correctas
-const respuestas: RespuestaCorrecta[] = [
-  {
-    pregunta: "Which country won the FIFA World Cup in 2022?",
-    respuesta: "Argentina"
-  },
-  {
-    pregunta: "Who is the all-time top scorer in UEFA Champions League history?",
-    respuesta: "Cristiano Ronaldo"
-  },
-  {
-    pregunta: "Which club has won the most Premier League titles?",
-    respuesta: "Manchester United"
-  },
-  {
-    pregunta: "In which year was the first FIFA World Cup held?",
-    respuesta: "1930"
-  },
-  {
-    pregunta: "Which player has won the most Ballon d'Or awards?",
-    respuesta: "Lionel Messi"
-  },
-  {
-    pregunta: "Which country hosted the 2018 FIFA World Cup?",
-    respuesta: "Russia"
-  },
-  {
-    pregunta: "What is the maximum number of players a team can have on the field during a match?",
-    respuesta: "11"
-  },
-  {
-    pregunta: 'Which club is known as "The Red Devils"?',
-    respuesta: "Manchester United"
-  },
-  {
-    pregunta: 'Who scored the "Hand of God" goal?',
-    respuesta: "Diego Maradona"
-  },
-  {
-    pregunta: 'Which stadium is known as "The Theatre of Dreams"?',
-    respuesta: "Old Trafford"
-  }
-];
+interface AnswerBank {
+  question: string;
+  answer: string;
+}
+
+interface TimingConfig {
+  answerDelay?: number; // Time to wait before answering (ms)
+  questionTimeout?: number; // Max time to wait for question (ms)
+  stabilizationDelay?: number; // Time to wait for UI to stabilize (ms)
+  closeDelay?: number; // Time to wait before closing (ms)
+}
+
+// Make all timing properties required
+type RequiredTimingConfig = Required<TimingConfig>;
 
 interface GameConfig {
   automaticMode: boolean;
-  specificGame?: string; // 'daily-trivia' | 'player-guess' | etc.
+  specificGame?: string;
   enableTimer?: boolean;
   timerSeconds?: number;
+  timing?: TimingConfig;
 }
 
-async function recordQuiz(
-  respuestasCorrectas: RespuestaCorrecta[] = [],
-  config: GameConfig = { automaticMode: false, enableTimer: true, timerSeconds: 15 }
-) {
-  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const videoPath = `videos/quiz-${timestamp}.mp4`;
-  
-  // Crear directorio de videos si no existe
-  const fs = require('fs');
-  if (!fs.existsSync('videos')) {
-    fs.mkdirSync('videos', { recursive: true });
-  }
+// State
+let quizAnswers: AnswerBank[] = [];
 
+// Utility Functions
+const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
+const log = (emoji: string, ...args: any[]) => {
+  console.log(emoji, ...args);
+};
+
+const logError = (emoji: string, ...args: any[]) => {
+  console.error(emoji, ...args);
+};
+
+// Core Functions
+async function fetchQuizAnswers(): Promise<QuizAnswer[]> {
+  const { API } = CONFIG;
+  try {
+    const response = await fetch(`${API.BASE_URL}${API.ENDPOINTS.QUIZ_ANSWERS}`);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch quiz answers: ${response.statusText}`);
+    }
+    return await response.json();
+  } catch (error) {
+    logError('❌', 'Error fetching quiz answers:', error);
+    throw error;
+  }
+}
+
+async function initializeQuiz(config: GameConfig) {
+  const apiAnswers = await fetchQuizAnswers();
+  quizAnswers = apiAnswers.map(({ pregunta, respuesta }) => ({
+    question: pregunta,
+    answer: respuesta
+  }));
+  log('✅', `Fetched ${quizAnswers.length} quiz answers from the API`);
+}
+
+async function setupBrowser() {
   const browser = await chromium.launch({
     headless: false,
-    slowMo: 300, // Reducido para mayor velocidad
-    devtools: false // Desactivar devtools para mejor rendimiento
+    slowMo: 300,
+    devtools: false
   });
 
   const context = await browser.newContext({
@@ -85,233 +108,260 @@ async function recordQuiz(
     }
   });
 
-  const page = await context.newPage();
+  return { browser, context, page: await context.newPage() };
+}
 
-  try {
-    if (config.automaticMode) {
-      // Modo automático: ir a la página de juegos y configurar
-      await page.goto("http://localhost:3000/games");
-      await page.waitForLoadState("networkidle");
-      
-      // Configurar temporizador si está habilitado
-      if (config.enableTimer) {
-        console.log("⚙️ Configurando temporizador...");
-        
-        // Habilitar el temporizador
-        const timerToggle = page.locator('#timer-toggle');
-        const isTimerEnabled = await timerToggle.getAttribute('aria-checked');
-        
-        if (isTimerEnabled === 'false') {
-          console.log("🕒 Activando temporizador...");
-          await timerToggle.click();
-          await page.waitForTimeout(500);
-        }
-        
-        // Configurar el tiempo
-        console.log(`⏱️ Configurando tiempo por pregunta a ${config.timerSeconds} segundos...`);
-        
-        // Esperar y hacer clic en el menú desplegable del temporizador
-        await page.waitForSelector('button[role="combobox"]', { timeout: 10000 });
-        const timerDropdown = await page.waitForSelector('button[role="combobox"]', { state: 'visible' });
-        await timerDropdown?.click();
-        
-        // Seleccionar el tiempo configurado
-        await page.waitForSelector('div[role="option"]', { timeout: 5000 });
-        const options = await page.$$('div[role="option"]');
-        
-        for (const option of options) {
-          const text = await option.textContent();
-          if (text?.includes(`${config.timerSeconds} seconds`)) {
-            await option.click();
-            console.log(`✅ Tiempo configurado a ${config.timerSeconds} segundos`);
-            break;
-          }
-        }
-        
-        await page.waitForTimeout(1000);
-      }
-      
-      // Iniciar el juego específico o el primero disponible
-      if (config.specificGame) {
-        console.log(`🕹️ Iniciando ${config.specificGame}...`);
-        const gameButton = page.locator(`button:has-text("${config.specificGame}")`).first();
-        await gameButton.click();
-      } else {
-        console.log("🕹️ Iniciando el primer juego disponible...");
-        const playButton = page.locator('button:has-text("Play Now")').first();
-        await playButton.click();
-      }
-      
-      await page.waitForLoadState("networkidle");
-    } else {
-      // Modo directo: ir directamente al juego especificado
-      const gamePath = config.specificGame || 'daily-trivia';
-      console.log(`🎮 Iniciando juego directamente: ${gamePath}`);
-      await page.goto(`http://localhost:3000/games/${gamePath}`);
-      await page.waitForLoadState("networkidle");
-    }
+async function setupAutomaticMode(page: Page, config: GameConfig) {
+  const { API, TIMING } = CONFIG;
+  
+  await page.goto(`${API.BASE_URL}/games`);
+  await page.waitForLoadState("networkidle");
 
-    await page.waitForSelector('[data-testid="quiz-game-container"]');
-    console.log("🎮 Quiz iniciado");
-
-    let questionNumber = 1;
-    const maxQuestions = 10;
-
-    while (questionNumber <= maxQuestions) {
-      console.log(`\n=== Pregunta ${questionNumber} ===`);
-
-      try {
-        await page.waitForSelector('[data-testid^="option-q"]');
-
-        const questionCounter = await page
-          .locator('[data-testid="question-counter"]')
-          .textContent();
-        const questionTextLocator = page.locator(
-          '[data-testid="quiz-game-container"] .p-6 h2'
-        );
-        const questionText = await questionTextLocator.textContent();
-        const preguntaActual = questionText || '';
-
-        console.log(`Contador: ${questionCounter}`);
-        console.log(`Pregunta: ${questionText}`);
-
-        const scoreText = await page
-          .locator('div:text("Score:")')
-          .first()
-          .textContent();
-        console.log(`Puntuación actual: ${scoreText}`);
-
-        const options = page.locator('[data-testid^="option-q"]');
-        const optionCount = await options.count();
-
-        if (optionCount === 0) {
-          console.log("⚠️ No se encontraron opciones. Quiz finalizado.");
-          break;
-        }
-
-        console.log(`Opciones disponibles (${optionCount}):`);
-        
-        // Obtener todas las opciones con su texto
-        const opciones: {texto: string, elemento: any}[] = [];
-        for (let i = 0; i < optionCount; i++) {
-          const elemento = options.nth(i);
-          const texto = await elemento.locator("span.font-medium").textContent() || '';
-          opciones.push({texto, elemento});
-          console.log(` ${i + 1}. ${texto}`);
-        }
-
-        // Buscar la respuesta correcta para esta pregunta
-        let indiceCorrecto = -1;
-        const respuestaCorrecta = respuestasCorrectas.find(r => 
-          typeof r.pregunta === 'string' 
-            ? preguntaActual.includes(r.pregunta)
-            : r.pregunta.test(preguntaActual)
-        );
-
-        if (respuestaCorrecta) {
-          console.log(`🔍 Buscando respuesta: "${respuestaCorrecta.respuesta}"`);
-          indiceCorrecto = opciones.findIndex(op => 
-            op.texto.trim() === respuestaCorrecta.respuesta.trim()
-          );
-        }
-
-        // Si no se encontró la respuesta correcta, seleccionar una al azar
-        if (indiceCorrecto === -1) {
-          console.log("⚠️ No se encontró la respuesta correcta en el banco de respuestas");
-          indiceCorrecto = Math.floor(Math.random() * optionCount);
-        }
-
-        const opcionSeleccionada = opciones[indiceCorrecto];
-        console.log(`✅ Seleccionando: "${opcionSeleccionada.texto}"`);
-        
-        // Hacer clic en la opción seleccionada
-        const selectedOption = opcionSeleccionada.elemento;
-        console.log("⏳ Esperando 3 segundos antes de seleccionar...");
-        await new Promise(resolve => setTimeout(resolve, 3000));
-        console.log("🖱️ Seleccionando opción...");
-        await selectedOption.click();
-
-        // Esperar feedback visual de la respuesta
-        console.log("⏳ Esperando respuesta...");
-        await page.waitForTimeout(1000);
-
-        // Esperar a que la pregunta cambie
-        console.log("🔄 Esperando cambio de pregunta...");
-        try {
-          await page.waitForFunction(
-            (currentQuestion) => {
-              const questionEl = document.querySelector('[data-testid="quiz-game-container"] .p-6 h2');
-              return questionEl && questionEl.textContent !== currentQuestion;
-            },
-            await questionTextLocator.textContent(),
-            { timeout: 10000 }
-          );
-          console.log("✅ Pregunta cambiada");
-        } catch (error) {
-          console.log("⚠️ No se detectó cambio de pregunta, continuando...");
-        }
-
-        // Pequeña pausa para asegurar que todo se ha estabilizado
-        await page.waitForTimeout(1000);
-
-        questionNumber++;
-      } catch (error) {
-        console.error(`⚠️ Error en la pregunta ${questionNumber}:`, error);
-        try {
-          await page.screenshot({
-            path: `debug-question-${questionNumber}.png`,
-            fullPage: true,
-          });
-          console.log(
-            `📸 Screenshot capturada: debug-question-${questionNumber}.png`
-          );
-        } catch (screenshotError) {
-          console.error("Error al capturar screenshot:", screenshotError);
-        }
-        break;
-      }
-    }
-
-    console.log("\n✅ Quiz completado");
-    console.log("⏳ Cerrando en 3 segundos...");
-  } catch (err) {
-    console.error("❌ Error general:", err);
-  } finally {
-    // Esperar 3 segundos antes de cerrar
-    await new Promise(resolve => setTimeout(resolve, 3000));
+  if (config.enableTimer) {
+    log('⚙️', 'Configuring timer...');
     
-    try {
-      // Cerrar el contexto para finalizar la grabación
-      await context.close();
-      
-      // Obtener la ruta del video grabado
-      const video = await page.video();
-      if (video) {
-        const videoPath = await video.path();
-        console.log(`🎥 Video guardado en: ${videoPath}`);
-      }
-    } catch (error) {
-      console.error('Error al guardar el video:', error);
-    } finally {
-      // Cerrar el navegador
-      await browser.close();
-      console.log("✅ Navegador cerrado");
+    // Habilitar el timer si no está habilitado
+    const timerToggle = page.locator('#timer-toggle');
+    const isTimerEnabled = await timerToggle.getAttribute('aria-checked');
+    
+    if (isTimerEnabled === 'false') {
+      log('🕒', 'Enabling timer...');
+      await timerToggle.click();
+      await delay(1000); // Dar tiempo a que se actualice la UI
     }
+    
+    // Configurar el tiempo por pregunta
+    log('⏱️', `Configuring time per question to ${config.timerSeconds} seconds...`);
+    
+    // Hacer clic en el botón del selector de tiempo
+    const timeSelector = page.locator('button[role="combobox"]').first();
+    await timeSelector.click();
+    await delay(500);
+    
+    // Seleccionar la opción correspondiente
+    const timeOption = page.locator(`div[role="option"]:has-text("${config.timerSeconds} seconds")`);
+    
+    if (await timeOption.count() > 0) {
+      await timeOption.click();
+      log('✅', `Time set to ${config.timerSeconds} seconds`);
+    } else {
+      log('⚠️', `Time option ${config.timerSeconds} seconds not found, using default`);
+      // Seleccionar la opción por defecto (15 segundos) si no se encuentra la opción
+      const defaultOption = page.locator('div[role="option"]:has-text("15 seconds")');
+      if (await defaultOption.count() > 0) {
+        await defaultOption.click();
+      }
+    }
+    
+    await delay(500);
+  }
+
+  log('🎮', 'Starting game...');
+  const gameButton = page.locator(`button:has-text("${config.specificGame || 'Daily Trivia'}")`);
+  
+  if (await gameButton.count() > 0) {
+    log('🎮', `Starting ${config.specificGame || 'Daily Trivia'}...`);
+    await gameButton.click();
+  } else {
+    log('🕹️', 'Starting the first available game...');
+    const playButton = page.locator('button:has-text("Play Now")').first();
+    await playButton.click();
+  }
+  
+  await page.waitForLoadState("networkidle");
+}
+
+async function setupDirectMode(page: Page, config: GameConfig) {
+  const { API } = CONFIG;
+  const gamePath = config.specificGame || 'daily-trivia';
+  log('🎮', `Starting game directly: ${gamePath}`);
+  await page.goto(`${API.BASE_URL}/games/${gamePath}`);
+  await page.waitForLoadState("networkidle");
+}
+
+async function answerQuestion(page: Page, questionNumber: number, timing: RequiredTimingConfig) {
+  const { SELECTORS, TIMING: DEFAULT_TIMING } = CONFIG;
+  const {
+    answerDelay = DEFAULT_TIMING.DEFAULT_ANSWER_DELAY,
+    questionTimeout = DEFAULT_TIMING.DEFAULT_QUESTION_TIMEOUT,
+    stabilizationDelay = DEFAULT_TIMING.DEFAULT_STABILIZATION_DELAY
+  } = timing;
+
+  log('\n', `=== Question ${questionNumber} ===`);
+  
+  // Wait for options to be available
+  await page.waitForSelector(SELECTORS.OPTION(), { state: 'visible', timeout: questionTimeout });
+  await delay(stabilizationDelay);
+
+  // Get question info
+  const questionCounter = await page.locator(SELECTORS.QUESTION_COUNTER).textContent();
+  const questionText = await page.locator(SELECTORS.QUESTION_TEXT).textContent() || '';
+  
+  log('📝', `Question ${questionCounter}: ${questionText}`);
+  
+  // Get score
+  const scoreText = await page.locator(SELECTORS.SCORE).first().textContent();
+  log('🏆', `Current score: ${scoreText}`);
+
+  // Process options
+  const options = page.locator(SELECTORS.OPTION());
+  const optionCount = await options.count();
+  
+  if (optionCount === 0) {
+    log('⚠️', 'No options found. Quiz finished.');
+    return false;
+  }
+
+  log('📋', `Available options (${optionCount}):`);
+  
+  // Get all options with their text
+  const optionsList = await Promise.all(
+    Array.from({ length: optionCount }, async (_, i) => {
+      const element = options.nth(i);
+      const text = (await element.locator(SELECTORS.OPTION_TEXT).textContent() || '').trim();
+      log(` ${i + 1}. ${text}`);
+      return { text, element };
+    })
+  );
+
+  // Find the correct answer
+  const correctAnswer = quizAnswers.find(qa => questionText.includes(qa.question));
+  let selectedOption = optionsList[Math.floor(Math.random() * optionCount)]; // Default to random
+
+  if (correctAnswer) {
+    log('🔍', `Looking for answer: "${correctAnswer.answer}"`);
+    const correctOption = optionsList.find(op => 
+      op.text === correctAnswer.answer.trim()
+    );
+    if (correctOption) selectedOption = correctOption;
+  } else {
+    log('⚠️', 'Correct answer not found in the answer bank, selecting randomly');
+  }
+
+  // Select the answer
+  log('✅', `Selecting: "${selectedOption.text}"`);
+  log('⏳', `Waiting ${answerDelay}ms before selecting...`);
+  await delay(answerDelay);
+  
+  log('🖱️', 'Selecting option...');
+  await selectedOption.element.click();
+
+  // Wait for answer feedback
+  log('⏳', 'Waiting for answer...');
+  await delay(stabilizationDelay);
+
+  // Wait for next question or end
+  try {
+    await page.waitForFunction(
+      (args: { currentQuestion: string; selector: string }) => {
+        const questionEl = document.querySelector(args.selector);
+        return questionEl ? questionEl.textContent !== args.currentQuestion : false;
+      },
+      { currentQuestion: questionText, selector: SELECTORS.QUESTION_TEXT },
+      { timeout: 2000 }
+    );
+    log('✅', 'Question changed');
+  } catch (error) {
+    log('⚠️', 'No question change detected, might be the last question');
+  }
+
+  return true;
+}
+
+async function takeScreenshot(page: Page, name: string) {
+  try {
+    const screenshotPath = `debug-${name}.png`;
+    await page.screenshot({ path: screenshotPath, fullPage: true });
+    log('📸', `Screenshot captured: ${screenshotPath}`);
+  } catch (error) {
+    logError('❌', 'Failed to capture screenshot:', error);
   }
 }
 
-// Ejemplos de uso:
+// Main Function
+export async function recordQuiz(config: GameConfig) {
+  // Set up timing with defaults
+  const timing: Required<TimingConfig> = {
+    answerDelay: 3000,
+    questionTimeout: 10000,
+    stabilizationDelay: 1000,
+    closeDelay: 3000,
+    ...config.timing
+  };
 
-// 1. Modo automático con configuración personalizada
-recordQuiz(respuestas, {
+  try {
+    // Initialize
+    await initializeQuiz(config);
+    
+    // Ensure videos directory exists
+    if (!fs.existsSync('videos')) {
+      fs.mkdirSync('videos', { recursive: true });
+    }
+
+    // Set up browser and page
+    const { browser, context, page } = await setupBrowser();
+
+    try {
+      // Set up game mode
+      if (config.automaticMode) {
+        await setupAutomaticMode(page, config);
+      } else {
+        await setupDirectMode(page, config);
+      }
+
+      // Start quiz
+      await page.waitForSelector(CONFIG.SELECTORS.QUIZ_CONTAINER);
+      log('🎮', 'Quiz started');
+
+      // Answer questions
+      let questionNumber = 1;
+      const maxQuestions = 10;
+
+      while (questionNumber <= maxQuestions) {
+        try {
+          const shouldContinue = await answerQuestion(page, questionNumber, timing);
+          if (!shouldContinue) break;
+          questionNumber++;
+        } catch (error) {
+          logError('⚠️', `Error on question ${questionNumber}:`, error);
+          await takeScreenshot(page, `question-${questionNumber}-error`);
+          break;
+        }
+      }
+
+      log('✅', 'Quiz completed');
+      log('⏳', `Closing in ${timing.closeDelay}ms...`);
+      await delay(timing.closeDelay);
+
+      // Save video
+      const video = await page.video();
+      if (video) {
+        const videoPath = await video.path();
+        log('🎥', `Video saved to: ${videoPath}`);
+      }
+    } finally {
+      await context.close();
+      await browser.close();
+      log('✅', 'Browser closed');
+    }
+  } catch (error) {
+    logError('❌', 'An error occurred:', error);
+    throw error;
+  }
+}
+
+// Example usage:
+
+recordQuiz({
   automaticMode: true,
+  specificGame: 'daily-trivia',
   enableTimer: true,
   timerSeconds: 15,
-  // specificGame: 'Daily Trivia' // Opcional: nombre exacto del juego
+  timing: {
+    answerDelay: 3000,       // 3 seconds before answering
+    questionTimeout: 10000,  // 10 seconds max to load question
+    stabilizationDelay: 1000, // 1 second for UI to stabilize
+    closeDelay: 3000         // 3 seconds before closing
+  }
 }).catch(console.error);
 
-// 2. Modo directo (como estaba antes)
-// recordQuiz(respuestas, {
-//   automaticMode: false,
-//   specificGame: 'daily-trivia' // o 'player-guess', etc.
-// }).catch(console.error);
